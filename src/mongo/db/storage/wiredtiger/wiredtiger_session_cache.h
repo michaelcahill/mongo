@@ -31,8 +31,9 @@
 
 #pragma once
 
-#include <string>
 #include <list>
+#include <string>
+#include <tuple>
 
 #include <boost/thread/shared_mutex.hpp>
 #include <wiredtiger.h>
@@ -44,6 +45,16 @@
 namespace mongo {
 
     class WiredTigerKVEngine;
+
+    class WiredTigerCachedCursor {
+    public:
+        WiredTigerCachedCursor(uint64_t id, uint64_t gen, WT_CURSOR *cursor) :
+            _id(id), _gen(gen), _cursor(cursor) {}
+
+        uint64_t _id;
+        uint64_t _gen;
+        WT_CURSOR* _cursor;
+    };
 
     /**
      * This is a structure that caches 1 cursor for each uri.
@@ -90,8 +101,7 @@ namespace mongo {
         friend class WiredTigerSessionCache;
 
         // The cursor cache is a list of pairs that contain an ID and cursor
-        typedef std::pair<uint64_t, WT_CURSOR*> CursorMap;
-        typedef std::list<CursorMap> CursorCache;
+        typedef std::list<WiredTigerCachedCursor> CursorCache;
 
         // Used internally by WiredTigerSessionCache
         int _getEpoch() const { return _epoch; }
@@ -99,7 +109,8 @@ namespace mongo {
         const int _epoch;
         WT_SESSION* _session; // owned
         CursorCache _cursors; // owned
-        int _cursorsOut;
+        uint64_t _cursorGen;
+        int _cursorsCached, _cursorsOut;
     };
 
     class WiredTigerSessionCache {
@@ -119,10 +130,8 @@ namespace mongo {
         WT_CONNECTION* conn() const { return _conn; }
 
     private:
-
         WiredTigerKVEngine* _engine; // not owned, might be NULL
         WT_CONNECTION* _conn; // not owned
-        int _epoch;
 
         // Regular operations take it in shared mode. Shutdown sets the _shuttingDown flag and
         // then takes it in exclusive mode. This ensures that all threads, which would return
@@ -130,10 +139,12 @@ namespace mongo {
         boost::shared_mutex _shutdownLock;
         AtomicUInt32 _shuttingDown; // Used as boolean - 0 = false, 1 = true
 
-        // The sessions are stored as a linked list stack. So we need to track the head
-        stdx::mutex _cacheLock;
+        SpinLock _cacheLock;
         typedef std::list<WiredTigerSession*> SessionCache;
         SessionCache _sessions;
+
+        // Bumped when all open sessions need to be closed
+        int _epoch;
 
         // How many sessions are in use concurrently
         std::atomic_uint_fast64_t _sessionsOut;

@@ -33,9 +33,6 @@
 
 #include <boost/thread.hpp>
 
-#include "mongo/db/stats/timer_stats.h"
-#include "mongo/db/commands/server_status_metric.h"
-
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
@@ -47,16 +44,14 @@ namespace mongo {
     WiredTigerSession::WiredTigerSession(WT_CONNECTION* conn, int epoch)
         : _epoch(epoch),
           _session(NULL),
-          _cursorsOut(0) {
+          _cursorGen(0), _cursorsCached(0), _cursorsOut(0) {
 
-        int ret = conn->open_session(conn, NULL, "isolation=snapshot", &_session);
-        invariantWTOK(ret);
+        invariantWTOK(conn->open_session(conn, NULL, "isolation=snapshot", &_session));
     }
 
     WiredTigerSession::~WiredTigerSession() {
         if (_session) {
-            int ret = _session->close(_session, NULL);
-            invariantWTOK(ret);
+            invariantWTOK(_session->close(_session, NULL));
         }
     }
 
@@ -65,11 +60,12 @@ namespace mongo {
                                             bool forRecordStore) {
 
         // Find the most recently used cursor
-        for (CursorCache::iterator i = _cursors.end(); i != _cursors.begin(); --i) {
-            if (i->first == id) {
-                WT_CURSOR *c = i->second;
+        for (CursorCache::iterator i = _cursors.begin(); i != _cursors.end(); ++i) {
+            if (i->_id == id) {
+                WT_CURSOR *c = i->_cursor;
                 _cursors.erase(i);
                 _cursorsOut++;
+                _cursorsCached--;
                 return c;
             }
         }
@@ -82,7 +78,8 @@ namespace mongo {
                                         &c);
         if (ret != ENOENT)
             invariantWTOK(ret);
-        if (c) _cursorsOut++;
+        if (c)
+            _cursorsOut++;
         return c;
     }
 
@@ -92,11 +89,18 @@ namespace mongo {
         _cursorsOut--;
 
         invariantWTOK(cursor->reset(cursor));
-        _cursors.push_back(std::make_pair(id, cursor));
 
-        if (_cursors.size() > 100u) {
-            cursor = _cursors.front().second;
-            _cursors.pop_front();
+        // Cursors are pushed to the front of the list and removed from the back
+        _cursors.push_front(WiredTigerCachedCursor(id, _cursorGen++, cursor));
+        _cursorsCached++;
+
+        // "Old" is defined as not used in the last N**2 operations, if we have N cursors cached.
+        // The reasoning here is to imagine a workload with N tables performing operations randomly
+        // across all of them.  We would like to cache N cursors in that case.
+        uint64_t cutoff = std::max(100, _cursorsCached * _cursorsCached);
+        while (_cursorGen - _cursors.back()._gen > cutoff) {
+            cursor = _cursors.back()._cursor;
+            _cursors.pop_back();
             invariantWTOK(cursor->close(cursor));
         }
     }
@@ -104,10 +108,9 @@ namespace mongo {
     void WiredTigerSession::closeAllCursors() {
         invariant(_session);
         for (CursorCache::iterator i = _cursors.begin(); i != _cursors.end(); ++i) {
-            WT_CURSOR *cursor = i->second;
+            WT_CURSOR *cursor = i->_cursor;
             if (cursor) {
-                int ret = cursor->close(cursor);
-                invariantWTOK(ret);
+                invariantWTOK(cursor->close(cursor));
             }
         }
         _cursors.clear();
@@ -154,10 +157,15 @@ namespace mongo {
 
     void WiredTigerSessionCache::closeAll() {
         // Increment the epoch as we are now closing all sessions with this epoch
-        _epoch++;
+        SessionCache swap;
 
-        stdx::lock_guard<stdx::mutex> lock(_cacheLock);
-        for (SessionCache::iterator i = _sessions.begin(); i != _sessions.end(); --i) {
+        {
+            stdx::lock_guard<SpinLock> lock(_cacheLock);
+            _epoch++;
+            _sessions.swap(swap);
+        }
+
+        for (SessionCache::iterator i = swap.begin(); i != swap.end(); i++) {
             delete (*i);
         }
     }
@@ -169,17 +177,19 @@ namespace mongo {
         // operations should be allowed to start.
         invariant(!_shuttingDown.loadRelaxed());
 
-        // Set the high water mark if we need too
+        // Set the high water mark if we need to
         if (++_sessionsOut > _highWaterMark) {
             _highWaterMark = _sessionsOut.load();
         }
 
         if (!_sessions.empty()) {
-            stdx::lock_guard<stdx::mutex> lock(_cacheLock);
+            stdx::lock_guard<SpinLock> lock(_cacheLock);
             if (!_sessions.empty()) {
-                WiredTigerSession* cachedSession = _sessions.front();
-                _sessions.pop_front();
-	        sessionsInCache.fetchAndSubtract(1);
+                // Get the most recently used session so that if we discard sessions, we're
+                // discarding older ones
+                WiredTigerSession* cachedSession = _sessions.back();
+                _sessions.pop_back();
+                sessionsInCache.fetchAndSubtract(1);
                 return cachedSession;
             }
        }
@@ -219,14 +229,14 @@ namespace mongo {
         // for concurrently. We also want to immediately delete any session that is from a
         // non-current epoch.
         if (session->_getEpoch() == _epoch && sessionsInCache.load() < _highWaterMark.load()) {
-            stdx::lock_guard<stdx::mutex> lock(_cacheLock);
+            returnedToCache = true;
+            stdx::lock_guard<SpinLock> lock(_cacheLock);
             _sessions.push_back(session);
-	    returnedToCache = true;
         }
 
         if (returnedToCache) {
-	    sessionsInCache.fetchAndAdd(1);
-	} else {
+            sessionsInCache.fetchAndAdd(1);
+        } else {
             delete session;
         }
 
