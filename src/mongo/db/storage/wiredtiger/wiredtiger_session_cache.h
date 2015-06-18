@@ -32,7 +32,7 @@
 #pragma once
 
 #include <string>
-#include <vector>
+#include <deque>
 
 #include <boost/thread/shared_mutex.hpp>
 #include <wiredtiger.h>
@@ -94,16 +94,16 @@ namespace mongo {
     private:
         friend class WiredTigerSessionCache;
 
-        // The cursor cache is a vector of pairs that contain an ID and cursor
+        // The cursor cache is a deque of pairs that contain an ID and cursor
         typedef std::pair<uint64_t, WT_CURSOR*> CursorMap;
-        typedef std::vector<CursorMap> CursorCache;
+        typedef std::deque<CursorMap> CursorCache;
 
         // Used internally by WiredTigerSessionCache
         int _getEpoch() const { return _epoch; }
 
         const int _epoch;
         WT_SESSION* _session; // owned
-        CursorCache _curmap; // owned
+        CursorCache _cursors; // owned
         int _cursorsOut;
 
         // Sessions are stored as a linked list stack. So each Session needs a pointer
