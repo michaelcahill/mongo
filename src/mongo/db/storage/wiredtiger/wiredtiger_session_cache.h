@@ -32,7 +32,7 @@
 #pragma once
 
 #include <string>
-#include <deque>
+#include <list>
 
 #include <boost/thread/shared_mutex.hpp>
 #include <wiredtiger.h>
@@ -64,7 +64,7 @@ namespace mongo {
          *          of -1 means that this value is not necessary since the session will not be
          *          cached.
          */
-        WiredTigerSession(WT_CONNECTION* conn, int epoch = -1, uint64_t id = 0);
+        WiredTigerSession(WT_CONNECTION* conn, int epoch = -1);
         ~WiredTigerSession();
 
         WT_SESSION* getSession() const { return _session; }
@@ -72,6 +72,7 @@ namespace mongo {
         WT_CURSOR* getCursor(const std::string& uri,
                              uint64_t id,
                              bool forRecordStore);
+
         void releaseCursor(uint64_t id, WT_CURSOR *cursor);
 
         void closeAllCursors();
@@ -80,23 +81,17 @@ namespace mongo {
 
         static uint64_t genCursorId();
 
-        WiredTigerSession* next() const { return _next; };
-
-        //WiredTigerCursor* setNext(WiredTigerCursor* next) { _next = next };
-
         /**
          * For "metadata:" cursors. Guaranteed never to collide with genCursorId() ids.
          */
         static const uint64_t kMetadataCursorId = 0;
 
-	uint64_t sessionId;
-
     private:
         friend class WiredTigerSessionCache;
 
-        // The cursor cache is a deque of pairs that contain an ID and cursor
+        // The cursor cache is a list of pairs that contain an ID and cursor
         typedef std::pair<uint64_t, WT_CURSOR*> CursorMap;
-        typedef std::deque<CursorMap> CursorCache;
+        typedef std::list<CursorMap> CursorCache;
 
         // Used internally by WiredTigerSessionCache
         int _getEpoch() const { return _epoch; }
@@ -105,20 +100,17 @@ namespace mongo {
         WT_SESSION* _session; // owned
         CursorCache _cursors; // owned
         int _cursorsOut;
-
-        // Sessions are stored as a linked list stack. So each Session needs a pointer
-        WiredTigerSession* _next;
     };
 
     class WiredTigerSessionCache {
     public:
 
-        WiredTigerSessionCache( WiredTigerKVEngine* engine );
-        WiredTigerSessionCache( WT_CONNECTION* conn );
+        WiredTigerSessionCache(WiredTigerKVEngine* engine);
+        WiredTigerSessionCache(WT_CONNECTION* conn);
         ~WiredTigerSessionCache();
 
         WiredTigerSession* getSession();
-        void releaseSession( WiredTigerSession* session );
+        void releaseSession(WiredTigerSession* session);
 
         void closeAll();
 
@@ -132,9 +124,6 @@ namespace mongo {
         WT_CONNECTION* _conn; // not owned
         int _epoch;
 
-        // We want to track how many sessions we have out concurrently
-        std::atomic_uint_fast64_t _sessionsOut;
-
         // Regular operations take it in shared mode. Shutdown sets the _shuttingDown flag and
         // then takes it in exclusive mode. This ensures that all threads, which would return
         // sessions to the cache would leak them.
@@ -142,9 +131,14 @@ namespace mongo {
         AtomicUInt32 _shuttingDown; // Used as boolean - 0 = false, 1 = true
 
         // The sessions are stored as a linked list stack. So we need to track the head
-        std::atomic<WiredTigerSession*> _head;
-        // This is the most sessions we have ever concurrently used. Its our naive way
-        // to know if we should toss a session or return it to cache
+        stdx::mutex _cacheLock;
+        typedef std::list<WiredTigerSession*> SessionCache;
+        SessionCache _sessions;
+
+        // How many sessions are in use concurrently
+        std::atomic_uint_fast64_t _sessionsOut;
+
+        // The most sessions we have ever in use concurrently.
         std::atomic_uint_fast64_t _highWaterMark;
     };
 

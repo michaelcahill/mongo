@@ -44,12 +44,10 @@
 
 namespace mongo {
 
-    WiredTigerSession::WiredTigerSession(WT_CONNECTION* conn, int epoch, uint64_t id)
-        : sessionId(id),
-          _epoch(epoch),
+    WiredTigerSession::WiredTigerSession(WT_CONNECTION* conn, int epoch)
+        : _epoch(epoch),
           _session(NULL),
-          _cursorsOut(0),
-          _next(0) {
+          _cursorsOut(0) {
 
         int ret = conn->open_session(conn, NULL, "isolation=snapshot", &_session);
         invariantWTOK(ret);
@@ -65,16 +63,17 @@ namespace mongo {
     WT_CURSOR* WiredTigerSession::getCursor(const std::string& uri,
                                             uint64_t id,
                                             bool forRecordStore) {
-        {
-             for (CursorCache::iterator i = _cursors.begin(); i != _cursors.end(); ++i) {
-                if (i->first == id) {
-                    WT_CURSOR *c = i->second;
-                    _cursors.erase(i);
-                    _cursorsOut++;
-                    return c;
-                }
+
+        // Find the most recently used cursor
+        for (CursorCache::iterator i = _cursors.end(); i != _cursors.begin(); --i) {
+            if (i->first == id) {
+                WT_CURSOR *c = i->second;
+                _cursors.erase(i);
+                _cursorsOut++;
+                return c;
             }
         }
+
         WT_CURSOR *c = NULL;
         int ret = _session->open_cursor(_session,
                                         uri.c_str(),
@@ -116,8 +115,7 @@ namespace mongo {
 
     namespace {
         AtomicUInt64 nextCursorId(1);
-        AtomicUInt64 currSessionsInCache(0);
-	    AtomicUInt64 nextSessionId(1);
+        AtomicUInt64 sessionsInCache(0);
     }
     // static
     uint64_t WiredTigerSession::genCursorId() {
@@ -128,14 +126,12 @@ namespace mongo {
 
     WiredTigerSessionCache::WiredTigerSessionCache(WiredTigerKVEngine* engine)
         : _engine(engine), _conn(engine->getConnection()),
-          _sessionsOut(0), _shuttingDown(0), _highWaterMark(1) {
-        _head = NULL;
+          _shuttingDown(0), _sessionsOut(0), _highWaterMark(1) {
     }
 
     WiredTigerSessionCache::WiredTigerSessionCache(WT_CONNECTION* conn)
         : _engine(NULL), _conn(conn),
-          _sessionsOut(0), _shuttingDown(0), _highWaterMark(1) {
-        _head = NULL;
+          _shuttingDown(0), _sessionsOut(0), _highWaterMark(1) {
     }
 
     WiredTigerSessionCache::~WiredTigerSessionCache() {
@@ -159,14 +155,11 @@ namespace mongo {
     void WiredTigerSessionCache::closeAll() {
         // Increment the epoch as we are now closing all sessions with this epoch
         _epoch++;
-        // Keep trying to remove the head until the list is empty
-        WiredTigerSession* cachedSession = _head.load();
-        while (cachedSession) {
-            if (_head.compare_exchange_weak(cachedSession, cachedSession->_next)) {
-                currSessionsInCache.fetchAndSubtract(1);
-                delete cachedSession;
-            }
-       }
+
+        stdx::lock_guard<stdx::mutex> lock(_cacheLock);
+        for (SessionCache::iterator i = _sessions.begin(); i != _sessions.end(); --i) {
+            delete (*i);
+        }
     }
 
     WiredTigerSession* WiredTigerSessionCache::getSession() {
@@ -181,22 +174,18 @@ namespace mongo {
             _highWaterMark = _sessionsOut.load();
         }
 
-        // We are popping here, compare_exchange will try and replace the
-        // current head (our session) with the next session in the queue
-        WiredTigerSession* cachedSession = _head.load();
-        while (cachedSession &&
-               !_head.compare_exchange_weak(cachedSession, cachedSession->_next)) {
-        }
-
-	    if (cachedSession) {
-            // Clear the next session for when we put it back
-            cachedSession->_next = 0;
-            currSessionsInCache.fetchAndSubtract(1);
-            return cachedSession;
+        if (!_sessions.empty()) {
+            stdx::lock_guard<stdx::mutex> lock(_cacheLock);
+            if (!_sessions.empty()) {
+                WiredTigerSession* cachedSession = _sessions.front();
+                _sessions.pop_front();
+	        sessionsInCache.fetchAndSubtract(1);
+                return cachedSession;
+            }
        }
 
         // Outside of the cache partition lock, but on release will be put back on the cache
-        return new WiredTigerSession(_conn, _epoch, nextSessionId.fetchAndAdd(1));
+        return new WiredTigerSession(_conn, _epoch);
     }
 
     void WiredTigerSessionCache::releaseSession(WiredTigerSession* session) {
@@ -221,37 +210,23 @@ namespace mongo {
             invariant(range == 0);
         }
 
+        _sessionsOut--;
+ 
         bool returnedToCache = false;
-
         invariant(session->_getEpoch() <= _epoch);
 
-        /**
-         * In this case we only want to return sessions until we hit the maximum number of
-         * sessions we have ever seen demand for concurrently. We also want to immediately
-         * delete any session that is from a non-current epoch.
-         */
-        if (session->_getEpoch() == _epoch) {
-            // Switch in the new head
-            // Use a separate variable to Avoid GCC bug 60272
-            WiredTigerSession *old_head = _head.load();
-            while (currSessionsInCache.load() < _highWaterMark.load()) {
-                session->_next = old_head;
-	            if (_head.compare_exchange_weak(old_head, session)) {
-                    returnedToCache = true;
-                    currSessionsInCache.fetchAndAdd(1);
-                    break;
-                }
-            }
+        // Only return sessions until we hit the maximum number of sessions we have ever seen demand
+        // for concurrently. We also want to immediately delete any session that is from a
+        // non-current epoch.
+        if (session->_getEpoch() == _epoch && sessionsInCache.load() < _highWaterMark.load()) {
+            stdx::lock_guard<stdx::mutex> lock(_cacheLock);
+            _sessions.push_back(session);
+	    returnedToCache = true;
         }
 
-        _sessionsOut--;
-        // Do all cleanup outside of the cache partition spinlock.
-        if (!returnedToCache) {
-            delete session;
-        }
-
-        // Do all cleanup outside of the cache partition spinlock.
-        if (!returnedToCache) {
+        if (returnedToCache) {
+	    sessionsInCache.fetchAndAdd(1);
+	} else {
             delete session;
         }
 
